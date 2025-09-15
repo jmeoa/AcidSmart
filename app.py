@@ -2,7 +2,7 @@ import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Business Case: Dosificación Inteligente de Ácido", layout="wide")
+st.set_page_config(page_title="SmartAcid Curado – Business Case", layout="wide")
 
 # ---------------------------------------------------------
 # Helpers
@@ -26,7 +26,7 @@ def compute_case(
     # Masa Cu en alimentación
     Cu_in_tpy = T * G
 
-    # Secuencia de recuperación
+    # Secuencia de recuperación (multiplicativa)
     R = [R0_pct]
     order = ["C1", "C2", "C3", "C4"]
     for i, c in enumerate(order, start=1):
@@ -36,9 +36,9 @@ def compute_case(
         R_next = R[i-1] * (1.0 + s * theta * gamma)
         R.append(R_next)
     R_raw_final = R[-1]
-    R_final = min(R_raw_final, Rmax_pct)
+    R_final = min(R_raw_final, Rmax_pct)  # techo técnico
 
-    # Secuencia de ácido
+    # Secuencia de ácido (reducción multiplicativa)
     A = [A0_kgpt]
     for i, c in enumerate(order, start=1):
         s = switches[c]
@@ -47,7 +47,7 @@ def compute_case(
         A_next = A[i-1] * (1.0 - s * theta * alpha)
         A.append(A_next)
     A_raw_final = A[-1]
-    A_final = max(A_raw_final, Amin_kgpt)
+    A_final = max(A_raw_final, Amin_kgpt)  # piso técnico
 
     # Incrementos (puntos % de recuperación)
     dR_total_pts = R_final - R0_pct
@@ -71,11 +71,9 @@ def compute_case(
     dR_pts_by = []
     for k in range(1, 5):
         dR_k = R[k] - R[k-1]
-        dR_pts_by.append(dR_k)
+        dR_pts_by.append(max(dR_k, 0.0))
     # Ajustar último tramo si topa Rmax
-    # Recalcular R con tope aplicado en el último paso si corresponde:
     if R_raw_final > Rmax_pct:
-        # Sobreescritura del último delta para que el total calce con R_final
         overshoot = R_raw_final - Rmax_pct
         dR_pts_by[-1] = max(dR_pts_by[-1] - overshoot, 0.0)
 
@@ -83,7 +81,7 @@ def compute_case(
     dA_by = []
     for k in range(1, 5):
         dA_k = A[k-1] - A[k]
-        dA_by.append(dA_k)
+        dA_by.append(max(dA_k, 0.0))
     # Ajustar último tramo si pisó Amin
     if A_raw_final < Amin_kgpt:
         undershoot = Amin_kgpt - A_raw_final
@@ -116,15 +114,11 @@ def compute_case(
     }
     return results
 
-def waterfall_benefit(benefits, labels, title, palette):
+def waterfall_benefit(benefits, labels, title):
     """Construye un Waterfall Plotly de aportes incrementales."""
     measure = ["relative"] * len(benefits) + ["total"]
     x = labels + ["Total"]
     y = benefits + [sum(benefits)]
-    # Colores por componente y total
-    base_colors = [palette[i % len(palette)] for i in range(len(benefits))]
-    total_color = "#0B5563"  # un azul profundo para el total
-    colors = base_colors + [total_color]
 
     fig = go.Figure(go.Waterfall(
         name="Beneficio",
@@ -133,9 +127,9 @@ def waterfall_benefit(benefits, labels, title, palette):
         x=x,
         y=y,
         connector={"line": {"width": 1}},
-        decreasing={"marker": {"color": "#DC5214"}},   # naranja para negativos (no debería haber)
-        increasing={"marker": {"color": "#328BA1"}},   # azul para positivos
-        totals={"marker": {"color": "#DEA942"}}        # dorado para total
+        decreasing={"marker": {"color": "#DC5214"}},  # naranja
+        increasing={"marker": {"color": "#328BA1"}},  # azul
+        totals={"marker": {"color": "#DEA942"}}       # dorado
     ))
     fig.update_layout(
         title=title,
@@ -146,21 +140,29 @@ def waterfall_benefit(benefits, labels, title, palette):
     return fig
 
 # ---------------------------------------------------------
-# Sidebar: Inputs
+# Sidebar: Inputs (todos parten en 0 según solicitud)
 # ---------------------------------------------------------
 st.sidebar.header("Parámetros de operación")
-T_Mt = st.sidebar.slider("Toneladas tratadas (Mt/a)", 5.0, 20.0, 10.0, 0.5)
-G_pct = st.sidebar.slider("Ley de Cu total (%)", 0.30, 1.00, 0.50, 0.01)
-R0_pct = st.sidebar.slider("Recuperación base R0 (%)", 50.0, 70.0, 60.0, 0.5)
-A0_kgpt = st.sidebar.slider("Consumo ácido base A0 (kg/t)", 25.0, 50.0, 35.0, 0.5)
+T_Mt = st.sidebar.slider("Toneladas tratadas (Mt/a)", 0.0, 20.0, 10.0, 0.1)      # min 0, step 0.1
+G_pct = st.sidebar.slider("Ley de Cu total (%)", 0.00, 1.00, 0.50, 0.01)         # min 0, step igual
+R0_pct = st.sidebar.slider("Recuperación base R0 (%)", 0.0, 100.0, 60.0, 0.5)    # min 0, step igual
+A0_kgpt = st.sidebar.slider("Consumo ácido base A0 (kg/t)", 0.0, 100.0, 35.0, 0.5)  # min 0, step igual
 
 st.sidebar.header("Precios")
-P_Cu = st.sidebar.slider("Precio Cu (US$/t)", 7000, 11000, 9000, 50)
-P_Acid = st.sidebar.slider("Precio ácido (US$/t H2SO4)", 80, 150, 120, 5)
+P_Cu = st.sidebar.slider("Precio Cu (US$/t)", 0, 11000, 9000, 50)               # min 0, step igual
+P_Acid = st.sidebar.slider("Precio ácido (US$/t H2SO4)", 0, 150, 120, 5)        # min 0, step igual
 
 st.sidebar.header("Límites técnicos")
-Rmax_pct = st.sidebar.slider("Recuperación máx. Rmax (%)", 65.0, 80.0, 75.0, 0.5)
-Amin_kgpt = st.sidebar.slider("Ácido mín. Amin (kg/t)", 15.0, 25.0, 20.0, 0.5)
+# Ambos límites parten en 0 según solicitud
+Rmax_pct = st.sidebar.slider("Recuperación máx. Rmax (%)", 0.0, 100.0, 75.0, 0.5)
+Amin_kgpt = st.sidebar.slider("Ácido mín. Amin (kg/t)", 0.0, 100.0, 20.0, 0.5)
+
+st.sidebar.caption(
+    "Rmax es el techo técnico de recuperación alcanzable con el mineral y condiciones de planta. "
+    "Amin es el piso técnico de ácido por seguridad y desempeño. "
+    "Si fijas Rmax < R0 no habrá espacio para mejorar la recuperación; "
+    "si fijas Amin > A0 no habrá espacio para ahorrar ácido."
+)
 
 st.sidebar.header("Activación de componentes")
 C1 = st.sidebar.checkbox("C1 – Soft Sensor P80", True)
@@ -170,15 +172,15 @@ C4 = st.sidebar.checkbox("C4 – Polinomio + Control", True)
 
 st.sidebar.header("Efectos (benchmark, relativos)")
 st.sidebar.caption("γ = mejora relativa de recuperación | α = reducción relativa de ácido")
-gamma1 = st.sidebar.number_input("γ1 C1", 0.0, 0.05, 0.005, 0.001, format="%.3f")
-gamma2 = st.sidebar.number_input("γ2 C2", 0.0, 0.05, 0.015, 0.001, format="%.3f")
-gamma3 = st.sidebar.number_input("γ3 C3", 0.0, 0.05, 0.010, 0.001, format="%.3f")
-gamma4 = st.sidebar.number_input("γ4 C4", 0.0, 0.05, 0.020, 0.001, format="%.3f")
+gamma1 = st.sidebar.number_input("γ1 C1", 0.0, 0.50, 0.005, 0.001, format="%.3f")
+gamma2 = st.sidebar.number_input("γ2 C2", 0.0, 0.50, 0.015, 0.001, format="%.3f")
+gamma3 = st.sidebar.number_input("γ3 C3", 0.0, 0.50, 0.010, 0.001, format="%.3f")
+gamma4 = st.sidebar.number_input("γ4 C4", 0.0, 0.50, 0.020, 0.001, format="%.3f")
 
-alpha1 = st.sidebar.number_input("α1 C1", 0.0, 0.30, 0.020, 0.005, format="%.3f")
-alpha2 = st.sidebar.number_input("α2 C2", 0.0, 0.30, 0.040, 0.005, format="%.3f")
-alpha3 = st.sidebar.number_input("α3 C3", 0.0, 0.30, 0.030, 0.005, format="%.3f")
-alpha4 = st.sidebar.number_input("α4 C4", 0.0, 0.30, 0.100, 0.005, format="%.3f")
+alpha1 = st.sidebar.number_input("α1 C1", 0.0, 0.50, 0.020, 0.005, format="%.3f")
+alpha2 = st.sidebar.number_input("α2 C2", 0.0, 0.50, 0.040, 0.005, format="%.3f")
+alpha3 = st.sidebar.number_input("α3 C3", 0.0, 0.50, 0.030, 0.005, format="%.3f")
+alpha4 = st.sidebar.number_input("α4 C4", 0.0, 0.50, 0.100, 0.005, format="%.3f")
 
 st.sidebar.header("Rendimientos decrecientes (θ)")
 thetaR1 = st.sidebar.number_input("θR1 C1", 0.0, 1.0, 1.00, 0.05)
@@ -191,8 +193,22 @@ thetaA2 = st.sidebar.number_input("θA2 C2", 0.0, 1.0, 0.85, 0.05)
 thetaA3 = st.sidebar.number_input("θA3 C3", 0.0, 1.0, 0.80, 0.05)
 thetaA4 = st.sidebar.number_input("θA4 C4", 0.0, 1.0, 0.70, 0.05)
 
-# Paleta corporativa
+# Paleta corporativa para componentes (usada en títulos/estilo si quieres extender)
 PALETTE = ["#328BA1", "#DEA942", "#DC5214"]
+
+# ---------------------------------------------------------
+# Validaciones de consistencia (UI warnings)
+# ---------------------------------------------------------
+if Rmax_pct < R0_pct:
+    st.warning("⚠️ Rmax es menor que la recuperación base R0. No habrá mejora posible en recuperación. "
+               "Sube Rmax o baja R0 para analizar beneficios realistas.")
+if Amin_kgpt > A0_kgpt:
+    st.warning("⚠️ Amin es mayor que el consumo base A0. No habrá ahorro posible de ácido. "
+               "Baja Amin o sube A0 para analizar beneficios realistas.")
+if T_Mt == 0 or G_pct == 0:
+    st.info("ℹ️ Con T=0 o Ley=0, el beneficio por cobre será 0 por definición (no hay producción).")
+if P_Cu == 0 and P_Acid == 0:
+    st.info("ℹ️ Con precios en 0, el beneficio económico será 0 aunque existan mejoras operacionales.")
 
 # ---------------------------------------------------------
 # Cálculos
@@ -212,7 +228,26 @@ res = compute_case(
 # ---------------------------------------------------------
 # Layout principal
 # ---------------------------------------------------------
-st.title("Business Case – Dosificación Inteligente de Ácido en Curado")
+st.title("SmartAcid Curado – Business Case de Dosificación de Ácido en Curado")
+
+with st.expander("ℹ️ ¿Qué son los límites técnicos (Rmax, Amin) y los θ de rendimientos decrecientes?"):
+    st.markdown(
+        """
+**Límites técnicos**
+- **Rmax**: techo técnico de recuperación dada la mineralogía, cinética y restricciones de planta. 
+  Evita que el modelo prometa recuperaciones imposibles; se aplica `R_final = min(R_raw, Rmax)`.
+- **Amin**: piso técnico de acidez por debajo del cual arriesgas subdosificación (mala disolución, 
+  pasivación, problemas de arranque). Se aplica `A_final = max(A_raw, Amin)`.
+
+**Rendimientos decrecientes (θ)**
+- Cada componente tiene un potencial relativo (γ para recuperación, α para ácido). 
+  Al encadenarlos, parte del beneficio ya fue capturado por los anteriores.
+- Los **θ ∈ [0,1]** modelan ese efecto: 
+  - θ=1 → el componente captura todo su potencial.
+  - θ<1 → el componente captura solo una fracción de su potencial (solapamiento).
+- Recomendación inicial: C1 con θ=1, y bajar θ gradualmente en C2–C4.
+        """
+    )
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Recuperación final (%)", f"{res['R_final_pct']:.2f}")
@@ -232,7 +267,7 @@ st.divider()
 # ---------------------------------------------------------
 labels = ["C1 SoftSensor", "C2 UGMs", "C3 Tracker", "C4 Polinomio"]
 benefits = res["B_by"]  # USD/año por componente (marginal)
-fig = waterfall_benefit(benefits, labels, "Waterfall – Aporte incremental por componente (USD/año)", PALETTE)
+fig = waterfall_benefit(benefits, labels, "Waterfall – Aporte incremental por componente (USD/año)")
 st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------
@@ -241,7 +276,12 @@ st.plotly_chart(fig, use_container_width=True)
 st.subheader("Aportes marginales por componente")
 rows = []
 order = ["C1", "C2", "C3", "C4"]
-names = {"C1":"C1 – Soft Sensor P80", "C2":"C2 – Clusterización UGMs", "C3":"C3 – Mineral Tracker", "C4":"C4 – Polinomio + Control"}
+names = {
+    "C1":"C1 – Soft Sensor P80",
+    "C2":"C2 – Clusterización UGMs",
+    "C3":"C3 – Mineral Tracker",
+    "C4":"C4 – Polinomio + Control"
+}
 for i, c in enumerate(order):
     rows.append({
         "Componente": names[c],
