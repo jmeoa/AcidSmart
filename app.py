@@ -149,18 +149,18 @@ def waterfall_benefit(benefits, labels, title, palette):
 # Sidebar: Inputs
 # ---------------------------------------------------------
 st.sidebar.header("Parámetros de operación")
-T_Mt = st.sidebar.slider("Toneladas tratadas (Mt/a)", 5.0, 20.0, 10.0, 0.5)
-G_pct = st.sidebar.slider("Ley de Cu total (%)", 0.30, 1.00, 0.50, 0.01)
-R0_pct = st.sidebar.slider("Recuperación base R0 (%)", 50.0, 70.0, 60.0, 0.5)
-A0_kgpt = st.sidebar.slider("Consumo ácido base A0 (kg/t)", 25.0, 50.0, 35.0, 0.5)
+T_Mt = st.sidebar.slider("Toneladas tratadas (Mt/a)", 0, 20.0, 10.0, 0.1)
+G_pct = st.sidebar.slider("Ley de Cu total (%)", 0, 1.00, 0.50, 0.01)
+R0_pct = st.sidebar.slider("Recuperación base R0 (%)", 0, 100, 60.0, 0.5)
+A0_kgpt = st.sidebar.slider("Consumo ácido base A0 (kg/t)", 0, 100, 15.0, 0.5)
 
 st.sidebar.header("Precios")
-P_Cu = st.sidebar.slider("Precio Cu (US$/t)", 7000, 11000, 9000, 50)
-P_Acid = st.sidebar.slider("Precio ácido (US$/t H2SO4)", 80, 150, 120, 5)
+P_Cu = st.sidebar.slider("Precio Cu (US$/t)", 0, 11000, 9000, 50)
+P_Acid = st.sidebar.slider("Precio ácido (US$/t H2SO4)", 0, 150, 120, 5)
 
 st.sidebar.header("Límites técnicos")
-Rmax_pct = st.sidebar.slider("Recuperación máx. Rmax (%)", 65.0, 80.0, 75.0, 0.5)
-Amin_kgpt = st.sidebar.slider("Ácido mín. Amin (kg/t)", 15.0, 25.0, 20.0, 0.5)
+Rmax_pct = st.sidebar.slider("Recuperación máx. Rmax (%)", 0, 100, 75.0, 0.5)
+Amin_kgpt = st.sidebar.slider("Ácido mín. Amin (kg/t)", 0, 50, 20.0, 0.5)
 
 st.sidebar.header("Activación de componentes")
 C1 = st.sidebar.checkbox("C1 – Soft Sensor P80", True)
