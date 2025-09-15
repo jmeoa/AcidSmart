@@ -1,252 +1,514 @@
-import streamlit as st
+# ============================================================
+# EDA Chancado — FUSIÓN (Streamlit Cloud, versión simple y útil)
+# Controles: Periodo, Métrica foco, Brecha Δ/%, Outliers, Sensibilidad,
+#            ANOVA α, Exportar PPT con notas del presentador
+# ============================================================
+
+import io, re
 import numpy as np
-import plotly.graph_objects as go
+import pandas as pd
+import streamlit as st
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib.ticker import StrMethodFormatter
+from matplotlib.dates import DateFormatter, MonthLocator
+from matplotlib import colors as mcolors
 
-st.set_page_config(page_title="Business Case: Dosificación Inteligente de Ácido", layout="wide")
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import pairwise_tukeyhsd, MultiComparison
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
-def fmt_money(x):
-    return f"${x:,.0f}"
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
 
-def compute_case(
-    T_Mt, G_pct, R0_pct, A0_kgpt,
-    P_Cu, P_Acid, Rmax_pct, Amin_kgpt,
-    gammas, alphas, thetas_R, thetas_A, switches
-):
-    """
-    Calcula resultados agregados, secuenciales e incrementales por componente.
-    switches: dict {'C1':0/1,'C2':0/1,'C3':0/1,'C4':0/1} en orden secuencial.
-    """
-    # Conversión tonelaje a t/a
-    T = T_Mt * 1_000_000.0
-    G = G_pct / 100.0
+st.set_page_config(page_title="EDA Chancado — FUSIÓN", layout="wide")
+sns.set_theme(style="whitegrid")
 
-    # Masa Cu en alimentación
-    Cu_in_tpy = T * G
+# ---------- Paleta ----------
+PALETTE = ["#328BA1", "#0B5563", "#00AFAA", "#66C7C7", "#BFD8D2", "#003B5C", "#7FB7BE"]
+custom_palette = PALETTE[:5]
 
-    # Secuencia de recuperación
-    R = [R0_pct]
-    order = ["C1", "C2", "C3", "C4"]
-    for i, c in enumerate(order, start=1):
-        s = switches[c]
-        theta = thetas_R[c]
-        gamma = gammas[c]
-        R_next = R[i-1] * (1.0 + s * theta * gamma)
-        R.append(R_next)
-    R_raw_final = R[-1]
-    R_final = min(R_raw_final, Rmax_pct)
+# ---------- Helpers ----------
+def _normalize_colname(c: str) -> str:
+    return (c.strip().lower()
+            .replace("/", "_")
+            .replace(" ", "_")
+            .replace("__","_"))
 
-    # Secuencia de ácido
-    A = [A0_kgpt]
-    for i, c in enumerate(order, start=1):
-        s = switches[c]
-        theta = thetas_A[c]
-        alpha = alphas[c]
-        A_next = A[i-1] * (1.0 - s * theta * alpha)
-        A.append(A_next)
-    A_raw_final = A[-1]
-    A_final = max(A_raw_final, Amin_kgpt)
+EXPECTED = {
+    "Fecha": ["fecha","date"],
+    "mineral_procesado_real_t": ["mineral_procesado_real_t","mineral_real_t","ton_real","tons_real"],
+    "rendimiento_real_tph": ["rendimiento_real_tph","tph_real","real_tph"],
+    "tiempo_operativo_real_h/dia": ["tiempo_operativo_real_h_dia","tiempo_operativo_real_h/dia","horas_reales","h_real"],
+    "mineral_procesado_plan_t": ["mineral_procesado_plan_t","mineral_plan_t","ton_plan","tons_plan"],
+    "rendimiento_plan_tph": ["rendimiento_plan_tph","tph_plan","plan_tph"],
+    "tiempo_operativo_plan_h/dia": ["tiempo_operativo_plan_h_dia","tiempo_operativo_plan_h/dia","horas_plan","h_plan"]
+}
 
-    # Incrementos (puntos % de recuperación)
-    dR_total_pts = R_final - R0_pct
+def _map_columns(df_cols):
+    norm_map = {_normalize_colname(c): c for c in df_cols}
+    mapping = {}
+    for std, aliases in EXPECTED.items():
+        found = None
+        for a in aliases + [_normalize_colname(std)]:
+            if a in norm_map:
+                found = norm_map[a]; break
+        mapping[std] = found
+    missing = [k for k,v in mapping.items() if v is None]
+    if missing:
+        raise ValueError(f"Faltan columnas requeridas en el CSV: {missing}")
+    return mapping
 
-    # Ahorro de ácido (kg/t)
-    dA_total_kgpt = A0_kgpt - A_final
-
-    # Producción adicional de Cu (t/a)
-    dCu_tpy = Cu_in_tpy * (dR_total_pts / 100.0)
-
-    # Ahorro ácido anual (t/a)
-    acid_saved_tpy = T * (dA_total_kgpt / 1000.0)
-
-    # Beneficios anuales
-    B_Cu = dCu_tpy * P_Cu
-    B_Acid = acid_saved_tpy * P_Acid
-    B_total = B_Cu + B_Acid
-
-    # Aportes marginales por componente (secuencial)
-    # Recuperación marginal por paso
-    dR_pts_by = []
-    for k in range(1, 5):
-        dR_k = R[k] - R[k-1]
-        dR_pts_by.append(dR_k)
-    # Ajustar último tramo si topa Rmax
-    # Recalcular R con tope aplicado en el último paso si corresponde:
-    if R_raw_final > Rmax_pct:
-        # Sobreescritura del último delta para que el total calce con R_final
-        overshoot = R_raw_final - Rmax_pct
-        dR_pts_by[-1] = max(dR_pts_by[-1] - overshoot, 0.0)
-
-    # Ácido marginal por paso (positivo = ahorro)
-    dA_by = []
-    for k in range(1, 5):
-        dA_k = A[k-1] - A[k]
-        dA_by.append(dA_k)
-    # Ajustar último tramo si pisó Amin
-    if A_raw_final < Amin_kgpt:
-        undershoot = Amin_kgpt - A_raw_final
-        dA_by[-1] = max(dA_by[-1] - undershoot, 0.0)
-
-    # Beneficio marginal por componente
-    B_by = []
-    for k, c in enumerate(order):
-        if switches[c] == 0:
-            B_by.append(0.0)
-            continue
-        dCu_k = Cu_in_tpy * (dR_pts_by[k] / 100.0)
-        acid_saved_k_tpy = T * (dA_by[k] / 1000.0)
-        B_k = dCu_k * P_Cu + acid_saved_k_tpy * P_Acid
-        B_by.append(B_k)
-
-    results = {
-        "R_final_pct": R_final,
-        "A_final_kgpt": A_final,
-        "dR_total_pts": dR_total_pts,
-        "dA_total_kgpt": dA_total_kgpt,
-        "dCu_tpy": dCu_tpy,
-        "acid_saved_tpy": acid_saved_tpy,
-        "B_Cu": B_Cu,
-        "B_Acid": B_Acid,
-        "B_total": B_total,
-        "dR_pts_by": dR_pts_by,
-        "dA_by": dA_by,
-        "B_by": B_by,
-    }
-    return results
-
-def waterfall_benefit(benefits, labels, title, palette):
-    """Construye un Waterfall Plotly de aportes incrementales."""
-    measure = ["relative"] * len(benefits) + ["total"]
-    x = labels + ["Total"]
-    y = benefits + [sum(benefits)]
-    # Colores por componente y total
-    base_colors = [palette[i % len(palette)] for i in range(len(benefits))]
-    total_color = "#0B5563"  # un azul profundo para el total
-    colors = base_colors + [total_color]
-
-    fig = go.Figure(go.Waterfall(
-        name="Beneficio",
-        orientation="v",
-        measure=measure,
-        x=x,
-        y=y,
-        connector={"line": {"width": 1}},
-        decreasing={"marker": {"color": "#DC5214"}},   # naranja para negativos (no debería haber)
-        increasing={"marker": {"color": "#328BA1"}},   # azul para positivos
-        totals={"marker": {"color": "#DEA942"}}        # dorado para total
-    ))
-    fig.update_layout(
-        title=title,
-        showlegend=False,
-        yaxis_title="USD/año",
-        margin=dict(l=10, r=10, t=60, b=10)
+def _to_num(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        series.astype(str)
+              .str.replace("\u00a0","", regex=False)
+              .str.replace(".", "", regex=False)
+              .str.replace(",", "", regex=False)
+              .str.strip(),
+        errors="coerce"
     )
+
+def _parse_fecha_mmddyyyy_with_report(s: pd.Series):
+    raw = s.astype(str).str.strip()
+    pat_exact = re.compile(r"^\d{2}-\d{2}\.\d{4}$")
+    exact_count = int(raw.apply(lambda x: bool(pat_exact.match(x))).sum())
+
+    s_norm = (raw
+              .str.replace("\u00a0","", regex=False)
+              .str.replace("/", "-", regex=False)
+              .str.replace(".", "-", regex=False))
+
+    fechas_strict = pd.to_datetime(s_norm, format="%m-%d-%Y", errors="coerce")
+    strict_ok = fechas_strict.notna()
+    fechas = fechas_strict.copy()
+
+    if (~strict_ok).any():
+        fechas_fallback = pd.to_datetime(s_norm[~strict_ok], errors="coerce", infer_datetime_format=True)
+        fechas.loc[~strict_ok] = fechas_fallback
+
+    report = {
+        "total": len(s),
+        "exact_mm-dd.yyyy": exact_count,
+        "parsed": int(fechas.notna().sum()),
+        "invalid": int(fechas.isna().sum())
+    }
+    st.caption(f"🗓️ Validación fechas: {report}")
+    return fechas
+
+def load_dataset_v2(df_in: pd.DataFrame) -> pd.DataFrame:
+    mapping = _map_columns(df_in.columns)
+    out = pd.DataFrame()
+    out["Fecha"] = _parse_fecha_mmddyyyy_with_report(df_in[mapping["Fecha"]])
+    for k in [k for k in EXPECTED.keys() if k!="Fecha"]:
+        out[k] = _to_num(df_in[mapping[k]])
+    out = out.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+    out["mes"] = out["Fecha"].dt.to_period("M").astype(str)
+    out["mes_fecha"] = pd.to_datetime(out["Fecha"].dt.to_period("M").astype(str) + "-01", errors="coerce")
+    # Producción diaria observada
+    out["produccion_t"] = out["rendimiento_real_tph"] * out["tiempo_operativo_real_h/dia"]
+    out["produccion_plan_t"] = out["rendimiento_plan_tph"] * out["tiempo_operativo_plan_h/dia"]
+    return out
+
+def remove_outliers_iqr(df, cols, factor=1.5):
+    d = df.copy()
+    mask = pd.Series(True, index=d.index)
+    for c in cols:
+        q1, q3 = d[c].quantile([0.25, 0.75])
+        iqr = q3 - q1
+        lo, hi = q1 - factor*iqr, q3 + factor*iqr
+        mask &= d[c].between(lo, hi) | d[c].isna()
+    return d[mask].copy()
+
+def month_order(values):
+    # 'YYYY-MM' -> datetime for sorting
+    return sorted(values, key=lambda x: pd.to_datetime(x+"-01"))
+
+def ci95(mean, std, n):
+    if n <= 1 or pd.isna(std): return 0.0
+    se = std/np.sqrt(n)
+    return 1.96*se
+
+def tukey_letters(data, group_col, value_col, alpha=0.05):
+    # Compact Letter Display from Tukey HSD
+    mc = MultiComparison(data[value_col].values, data[group_col].values)
+    res = mc.tukeyhsd(alpha=alpha)
+    groups = mc.groupsunique
+    # Build adjacency: not significantly different -> connect
+    # res.reject True means different; False means same group
+    n = len(groups)
+    same = {g:set([g]) for g in groups}
+    for i in range(len(res.reject)):
+        a, b = res._multicomp.pairindices[i]
+        ga, gb = groups[a], groups[b]
+        if not res.reject[i]:
+            same[ga].add(gb); same[gb].add(ga)
+    # Greedy letter assignment
+    letters = {g:"" for g in groups}
+    assigned = []
+    for g in groups:
+        placed = False
+        for lset, letter in assigned:
+            # can we put g into this letter group? must be same with all in lset
+            if all((gg in same[g]) for gg in lset):
+                lset.add(g); letters[g]+=letter; placed=True; break
+        if not placed:
+            new_letter = chr(ord('A')+len(assigned))
+            assigned.append((set([g]), new_letter))
+            letters[g]+=new_letter
+    return letters  # dict: group -> letters like 'A', 'AB', ...
+
+# ---------- Sidebar (7 controles esenciales) ----------
+st.sidebar.title("Controles")
+
+uploaded = st.sidebar.file_uploader("📂 Sube tu CSV", type=["csv","txt"])
+sep_semicolon = st.sidebar.checkbox("Separador ';'", value=False)
+if uploaded is None:
+    st.info("Sube un CSV para iniciar el análisis.")
+    st.stop()
+
+try:
+    raw = pd.read_csv(uploaded, sep=";" if sep_semicolon else ",")
+except Exception:
+    raw = pd.read_csv(uploaded, sep=None, engine="python")
+
+df = load_dataset_v2(raw)
+
+# 1) Periodo (mes inicio–fin)
+meses_all = month_order(df["mes"].dropna().unique())
+mes_ini, mes_fin = st.sidebar.select_slider("Periodo (mes)", options=meses_all, value=(meses_all[0], meses_all[-1]))
+mask_periodo = (df["mes"] >= mes_ini) & (df["mes"] <= mes_fin)
+dfp = df.loc[mask_periodo].copy()
+
+# 2) Métrica foco
+metrica_foco = st.sidebar.radio("Métrica foco", ["Producción","TPH","Horas"], index=0)
+
+# 3) Brecha vs plan (Δ ó %)
+modo_brecha = st.sidebar.radio("Brecha vs plan", ["Δ absoluto","Δ %"], index=0)
+
+# 4) Outliers simple (IQR 1.5×)
+filtrar_outliers = st.sidebar.checkbox("Quitar outliers (IQR 1.5×)", value=False)
+if filtrar_outliers:
+    dfp = remove_outliers_iqr(
+        dfp,
+        ["rendimiento_real_tph","tiempo_operativo_real_h/dia","produccion_t"],
+        factor=1.5
+    )
+
+# 5) Sensibilidad (rápida)
+delta_tph_max = st.sidebar.slider("ΔTPH máximo (%)", 0, 10, 5)
+delta_h_max = st.sidebar.slider("ΔHoras máximo (h/d)", 0.0, 4.0, 1.0, step=0.5)
+baseline_real = st.sidebar.checkbox("Baseline real (recomendado)", value=True)
+
+# 6) Significancia ANOVA
+alpha = 0.05 if st.sidebar.radio("α (significancia ANOVA)", ["0.05","0.10"], index=0)=="0.05" else 0.10
+
+# 7) Exportación (PPT con notas)
+incluir_notas = st.sidebar.checkbox("Incluir notas del presentador en PPT", value=True)
+
+st.markdown(f"**Periodo aplicado:** {mes_ini} → {mes_fin}  •  Filas: {len(dfp):,}")
+
+# ================= Resumen KPIs & narrativa =================
+def resumen_kpis(d):
+    kpis = {
+        "Mineral real (t)": d["mineral_procesado_real_t"].sum(),
+        "Mineral plan (t)": d["mineral_procesado_plan_t"].sum(),
+        "Producción real (t)": d["produccion_t"].sum(),
+        "Producción plan (t)": d["produccion_plan_t"].sum(),
+        "TPH real prom": d["rendimiento_real_tph"].mean(),
+        "TPH plan prom": d["rendimiento_plan_tph"].mean(),
+        "Horas reales prom": d["tiempo_operativo_real_h/dia"].mean(),
+        "Horas plan prom": d["tiempo_operativo_plan_h/dia"].mean(),
+    }
+    return pd.DataFrame({"KPI": list(kpis.keys()), "Valor": list(kpis.values())})
+
+kpi_df = resumen_kpis(dfp)
+c1, c2 = st.columns([1,1])
+with c1:
+    st.subheader("KPIs del periodo")
+    st.dataframe(kpi_df.style.format({"Valor":"{:,.2f}"}), use_container_width=True)
+with c2:
+    st.subheader("Narrativa técnica (auto)")
+    # Stats base
+    tph_mean = dfp["rendimiento_real_tph"].mean()
+    tph_med  = dfp["rendimiento_real_tph"].median()
+    h_mean   = dfp["tiempo_operativo_real_h/dia"].mean()
+    h_med    = dfp["tiempo_operativo_real_h/dia"].median()
+    # CV mensual
+    cvm = dfp.groupby("mes").agg(
+        cv_tph=("rendimiento_real_tph", lambda x: np.std(x, ddof=1)/np.mean(x) if np.mean(x)>0 else np.nan),
+        cv_h  =("tiempo_operativo_real_h/dia", lambda x: np.std(x, ddof=1)/np.mean(x) if np.mean(x)>0 else np.nan),
+    ).reset_index()
+    cv_tph_min, cv_tph_max = np.nanmin(cvm["cv_tph"]), np.nanmax(cvm["cv_tph"])
+    cv_h_max = np.nanmax(cvm["cv_h"])
+    mes_cv_h_alto = cvm.loc[cvm["cv_h"].idxmax(), "mes"] if cvm["cv_h"].notna().any() else "-"
+    # Brechas promedio
+    delta_tph_prom = (dfp["rendimiento_real_tph"] - dfp["rendimiento_plan_tph"]).mean()
+    delta_h_prom   = (dfp["tiempo_operativo_real_h/dia"] - dfp["tiempo_operativo_plan_h/dia"]).mean()
+    # Equivalencia empírica
+    sum_TPH = dfp["rendimiento_real_tph"].sum()
+    sum_TPH_H = (dfp["rendimiento_real_tph"] * dfp["tiempo_operativo_real_h/dia"]).sum()
+    dh_equiv = 0.01 * (sum_TPH_H / max(sum_TPH, 1e-9))
+
+    narrativa = [
+        f"Periodo analizado {mes_ini}–{mes_fin}.",
+        f"TPH real: media {tph_mean:.1f}, mediana {tph_med:.1f}. Horas reales: media {h_mean:.2f} h/d, mediana {h_med:.2f} h/d.",
+        f"Variabilidad mensual: CV(TPH) entre {cv_tph_min:.2f} y {cv_tph_max:.2f}; CV(Horas) máx {cv_h_max:.2f} en {mes_cv_h_alto}.",
+        f"Brechas promedio vs plan — ΔTPH {delta_tph_prom:+.1f}, ΔHoras {delta_h_prom:+.1f} h/d.",
+        f"Equivalencia empírica: 1% TPH ≈ {dh_equiv:.2f} h/d (si <0.6 favorece disponibilidad; si ≥0.6 favorece capacidad instantánea)."
+    ]
+    st.markdown("\n\n".join(["- " + s for s in narrativa]))
+
+# ================= Comparación vs plan (mensual) + Brecha mensual =================
+st.markdown("---")
+st.subheader("Comparación mensual vs plan")
+
+agg_fun = "mean"  # simple y robusto; podrías exponerlo como control
+gm = dfp.groupby("mes", as_index=False).agg({
+    "rendimiento_real_tph": agg_fun,
+    "rendimiento_plan_tph": agg_fun,
+    "tiempo_operativo_real_h/dia": agg_fun,
+    "tiempo_operativo_plan_h/dia": agg_fun,
+    "produccion_t": agg_fun,
+    "produccion_plan_t": agg_fun
+})
+gm = gm.sort_values("mes")
+
+def plot_grouped_bars(dfm, y_real, y_plan, title):
+    fig, ax = plt.subplots(figsize=(12,4.8))
+    x = np.arange(len(dfm))
+    w = 0.38
+    ax.bar(x-w/2, dfm[y_real], width=w, label="Real", color=custom_palette[0])
+    ax.bar(x+w/2, dfm[y_plan], width=w, label="Plan", color=custom_palette[2])
+    ax.set_xticks(x)
+    ax.set_xticklabels(dfm["mes"], rotation=45, ha="right")
+    ax.set_title(title); ax.legend()
+    ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
     return fig
 
-# ---------------------------------------------------------
-# Sidebar: Inputs
-# ---------------------------------------------------------
-st.sidebar.header("Parámetros de operación")
-T_Mt = st.sidebar.slider("Toneladas tratadas (Mt/a)", 0, 20.0, 10.0, 0.1)
-G_pct = st.sidebar.slider("Ley de Cu total (%)", 0, 1.00, 0.50, 0.01)
-R0_pct = st.sidebar.slider("Recuperación base R0 (%)", 0, 100, 60.0, 0.5)
-A0_kgpt = st.sidebar.slider("Consumo ácido base A0 (kg/t)", 0, 100, 15.0, 0.5)
+def plot_brecha_mensual(dfm, y_real, y_plan, title, modo="Δ absoluto"):
+    d = dfm.copy()
+    if modo == "Δ absoluto":
+        d["brecha"] = d[y_real] - d[y_plan]
+        label_fmt = lambda v: f"{v:+.1f}"
+        yfmt = StrMethodFormatter("{x:,.1f}")
+    else:
+        base = d[y_plan].replace(0, np.nan)
+        d["brecha"] = (d[y_real] - d[y_plan]) / base * 100.0
+        label_fmt = lambda v: f"{v:+.1f}%"
+        yfmt = StrMethodFormatter("{x:,.0f}%")
+    fig, ax = plt.subplots(figsize=(12,4.8))
+    colors = [custom_palette[0] if v>=0 else "#C64756" for v in d["brecha"]]
+    ax.bar(d["mes"], d["brecha"], color=colors)
+    ax.set_title(title)
+    ax.yaxis.set_major_formatter(yfmt)
+    ax.grid(axis="y", alpha=0.25)
+    # etiquetas
+    for i, v in enumerate(d["brecha"]):
+        ax.text(i, v + (0.02*np.nanmax(np.abs(d["brecha"])) if v>=0 else -0.02*np.nanmax(np.abs(d["brecha"]))),
+                label_fmt(v), ha="center", va="bottom" if v>=0 else "top", fontsize=9)
+    plt.xticks(rotation=45, ha="right"); plt.tight_layout()
+    return fig
 
-st.sidebar.header("Precios")
-P_Cu = st.sidebar.slider("Precio Cu (US$/t)", 0, 11000, 9000, 50)
-P_Acid = st.sidebar.slider("Precio ácido (US$/t H2SO4)", 0, 150, 120, 5)
+# Elegir métrica foco para el primer bloque
+if metrica_foco == "TPH":
+    st.pyplot(plot_grouped_bars(gm, "rendimiento_real_tph", "rendimiento_plan_tph", "TPH — Real vs Plan (mensual)"), use_container_width=True)
+    st.pyplot(plot_brecha_mensual(gm, "rendimiento_real_tph", "rendimiento_plan_tph", "Brecha mensual TPH (Real–Plan)", modo_brecha), use_container_width=True)
+elif metrica_foco == "Horas":
+    st.pyplot(plot_grouped_bars(gm, "tiempo_operativo_real_h/dia", "tiempo_operativo_plan_h/dia", "Horas/día — Real vs Plan (mensual)"), use_container_width=True)
+    st.pyplot(plot_brecha_mensual(gm, "tiempo_operativo_real_h/dia", "tiempo_operativo_plan_h/dia", "Brecha mensual Horas (Real–Plan)", modo_brecha), use_container_width=True)
+else:
+    st.pyplot(plot_grouped_bars(gm, "produccion_t", "produccion_plan_t", "Producción (t) — Real vs Plan (mensual)"), use_container_width=True)
+    st.pyplot(plot_brecha_mensual(gm, "produccion_t", "produccion_plan_t", "Brecha mensual Producción (Real–Plan)", modo_brecha), use_container_width=True)
 
-st.sidebar.header("Límites técnicos")
-Rmax_pct = st.sidebar.slider("Recuperación máx. Rmax (%)", 0, 100, 75.0, 0.5)
-Amin_kgpt = st.sidebar.slider("Ácido mín. Amin (kg/t)", 0, 50, 20.0, 0.5)
+# ================= ANOVA visual (mes) =================
+st.markdown("---")
+st.subheader("ANOVA visual por mes")
 
-st.sidebar.header("Activación de componentes")
-C1 = st.sidebar.checkbox("C1 – Soft Sensor P80", True)
-C2 = st.sidebar.checkbox("C2 – Clusterización UGMs", True)
-C3 = st.sidebar.checkbox("C3 – Mineral Tracker", True)
-C4 = st.sidebar.checkbox("C4 – Polinomio + Control", True)
+def anova_visual(d, col, ylabel):
+    # tabla ANOVA
+    model = ols(f"Q('{col}') ~ C(mes)", data=d).fit()
+    anova_tbl = sm.stats.anova_lm(model, typ=2).round(4)
 
-st.sidebar.header("Efectos (benchmark, relativos)")
-st.sidebar.caption("γ = mejora relativa de recuperación | α = reducción relativa de ácido")
-gamma1 = st.sidebar.number_input("γ1 C1", 0.0, 0.05, 0.005, 0.001, format="%.3f")
-gamma2 = st.sidebar.number_input("γ2 C2", 0.0, 0.05, 0.015, 0.001, format="%.3f")
-gamma3 = st.sidebar.number_input("γ3 C3", 0.0, 0.05, 0.010, 0.001, format="%.3f")
-gamma4 = st.sidebar.number_input("γ4 C4", 0.0, 0.05, 0.020, 0.001, format="%.3f")
+    # medias, IC95 y letras Tukey
+    stats = d.groupby("mes").agg(mean=(col,"mean"), std=(col,"std"), n=(col,"count")).reset_index()
+    stats["ci"] = stats.apply(lambda r: ci95(r["mean"], r["std"], r["n"]), axis=1)
 
-alpha1 = st.sidebar.number_input("α1 C1", 0.0, 0.30, 0.020, 0.005, format="%.3f")
-alpha2 = st.sidebar.number_input("α2 C2", 0.0, 0.30, 0.040, 0.005, format="%.3f")
-alpha3 = st.sidebar.number_input("α3 C3", 0.0, 0.30, 0.030, 0.005, format="%.3f")
-alpha4 = st.sidebar.number_input("α4 C4", 0.0, 0.30, 0.100, 0.005, format="%.3f")
+    # Tukey (solo si al menos 2 niveles)
+    letters_map = {}
+    try:
+        letters_map = tukey_letters(d[["mes",col]].dropna(), "mes", col, alpha=alpha)
+    except Exception:
+        letters_map = {m:"" for m in stats["mes"]}
 
-st.sidebar.header("Rendimientos decrecientes (θ)")
-thetaR1 = st.sidebar.number_input("θR1 C1", 0.0, 1.0, 1.00, 0.05)
-thetaR2 = st.sidebar.number_input("θR2 C2", 0.0, 1.0, 0.80, 0.05)
-thetaR3 = st.sidebar.number_input("θR3 C3", 0.0, 1.0, 0.70, 0.05)
-thetaR4 = st.sidebar.number_input("θR4 C4", 0.0, 1.0, 0.60, 0.05)
+    stats = stats.sort_values("mes")
+    fig, ax = plt.subplots(figsize=(12,4.8))
+    x = np.arange(len(stats))
+    ax.errorbar(x, stats["mean"], yerr=stats["ci"], fmt="o-", capsize=4, label="Media ± IC95%", color=custom_palette[0])
+    ax.set_xticks(x); ax.set_xticklabels(stats["mes"], rotation=45, ha="right")
+    ax.set_title(f"{ylabel}: Medias mensuales con IC95% (α={alpha})")
+    ax.grid(True, alpha=0.25)
+    ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.1f}"))
+    # letras sobre puntos
+    for i, row in stats.iterrows():
+        ax.text(i, row["mean"] + (0.02*np.nanmax(stats["mean"]) if np.nanmax(stats["mean"])>0 else 0.5),
+                letters_map.get(row["mes"], ""), ha="center", va="bottom", fontsize=10, color="#003B5C")
+    plt.tight_layout()
+    return fig, anova_tbl
 
-thetaA1 = st.sidebar.number_input("θA1 C1", 0.0, 1.0, 1.00, 0.05)
-thetaA2 = st.sidebar.number_input("θA2 C2", 0.0, 1.0, 0.85, 0.05)
-thetaA3 = st.sidebar.number_input("θA3 C3", 0.0, 1.0, 0.80, 0.05)
-thetaA4 = st.sidebar.number_input("θA4 C4", 0.0, 1.0, 0.70, 0.05)
+# Mostrar dos: TPH y Horas (si foco es Producción igual mostramos ambos para ANOVA)
+c1, c2 = st.columns(2)
+with c1:
+    fig_tph, anova_tph = anova_visual(dfp, "rendimiento_real_tph", "TPH")
+    st.pyplot(fig_tph, use_container_width=True)
+    st.dataframe(anova_tph, use_container_width=True)
+with c2:
+    fig_h, anova_h = anova_visual(dfp, "tiempo_operativo_real_h/dia", "Horas/día")
+    st.pyplot(fig_h, use_container_width=True)
+    st.dataframe(anova_h, use_container_width=True)
 
-# Paleta corporativa
-PALETTE = ["#328BA1", "#DEA942", "#DC5214"]
+# ================= Sensibilidad (iso-%) — baseline real para evitar negativos falsos =================
+st.markdown("---")
+st.subheader("Sensibilidad (iso-%)")
 
-# ---------------------------------------------------------
-# Cálculos
-# ---------------------------------------------------------
-gammas = {"C1": gamma1, "C2": gamma2, "C3": gamma3, "C4": gamma4}
-alphas = {"C1": alpha1, "C2": alpha2, "C3": alpha3, "C4": alpha4}
-thetas_R = {"C1": thetaR1, "C2": thetaR2, "C3": thetaR3, "C4": thetaR4}
-thetas_A = {"C1": thetaA1, "C2": thetaA2, "C3": thetaA3, "C4": thetaA4}
-switches = {"C1": int(C1), "C2": int(C2), "C3": int(C3), "C4": int(C4)}
+mean_tph = float(dfp["rendimiento_real_tph"].mean())
+mean_h   = float(dfp["tiempo_operativo_real_h/dia"].mean())
 
-res = compute_case(
-    T_Mt, G_pct, R0_pct, A0_kgpt,
-    P_Cu, P_Acid, Rmax_pct, Amin_kgpt,
-    gammas, alphas, thetas_R, thetas_A, switches
+if baseline_real:
+    # producción media diaria observada
+    baseline_iso = float((dfp["produccion_t"].mean()))
+else:
+    baseline_iso = mean_tph * mean_h
+
+# Construimos malla simple: 0..Δmax con paso 1% y 0.5h
+tph_grid = np.arange(0, delta_tph_max+0.001, 1) / 100.0
+h_grid = np.arange(0.0, delta_h_max+1e-9, 0.5)
+
+cells = []
+for dH in h_grid:
+    for dT in tph_grid:
+        h_new   = mean_h * (1 + 0) + dH   # sumamos horas absolutas
+        tph_new = mean_tph * (1 + dT)
+        tons_new = tph_new * h_new
+        val = ((tons_new / max(baseline_iso, 1e-9)) - 1.0) * 100.0
+        cells.append({"delta_h_abs": dH, "delta_tph_pct": dT, "tons_pct": val})
+grid = pd.DataFrame(cells)
+pv = grid.pivot(index="delta_tph_pct", columns="delta_h_abs", values="tons_pct")
+
+cmap = mcolors.LinearSegmentedColormap.from_list("afines_heat", ["#E0F7FA", "#00AFAA", "#0B5563"])
+fig_iso, ax = plt.subplots(figsize=(10,6))
+sns.heatmap(pv, annot=True, fmt=".1f", cmap=cmap, cbar_kws={"label": "Δ Producción (%)"},
+            annot_kws={"fontsize": 10}, ax=ax)
+ax.set_title("Iso-%: impacto de ΔTPH (%) y ΔHoras (h/d) sobre producción (%)")
+ax.set_xlabel("Δ Horas (h/d)"); ax.set_ylabel("Δ TPH (%)")
+
+xt = [f"{v:+.1f}h" for v in pv.columns]
+yt = [f"{v*100:.0f}%" for v in pv.index]
+# Ticks compat
+posx = np.arange(len(xt)) + 0.5
+ax.set_xticks(posx); ax.set_xticklabels(xt)
+posy = np.arange(len(yt)) + 0.5
+ax.set_yticks(posy); ax.set_yticklabels(yt)
+ax.tick_params(axis="x", rotation=0); ax.tick_params(axis="y", rotation=0)
+plt.tight_layout()
+st.pyplot(fig_iso, use_container_width=True)
+
+# ================= PPT con notas del presentador =================
+st.markdown("---")
+st.subheader("Exportar")
+
+def save_fig_bytes(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+    buf.seek(0); return buf
+
+def table_fig(df_table, title):
+    fig, ax = plt.subplots(figsize=(7.5,3.0))
+    ax.axis("off")
+    tb = df_table.copy()
+    if "sum_sq" in tb.columns:
+        tb = tb.round({"sum_sq":4, "df":2, "F":3, "PR(>F)":4})
+    tb = tb.reset_index()
+    tbl = ax.table(cellText=tb.values, colLabels=tb.columns.tolist(), loc="center")
+    tbl.scale(1,1.1)
+    ax.set_title(title, pad=6)
+    plt.tight_layout()
+    return fig
+
+def build_ppt(df_periodo, figs, notes_by_slide, titulo_portada, incluir_notas=True):
+    prs = Presentation()
+    prs.slide_width  = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+
+    def add_image_slide(title, img_bytes, notes_text=""):
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        tx = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(12.3), Inches(0.8))
+        p = tx.text_frame.paragraphs[0]
+        p.text = title; p.font.size = Pt(28); p.font.bold = True; p.font.color.rgb = RGBColor(0x32,0x8B,0xA1)
+        slide.shapes.add_picture(img_bytes, Inches(0.5), Inches(1.1), width=Inches(12.3))
+        if incluir_notas:
+            notes = slide.notes_slide.notes_text_frame
+            notes.text = notes_text
+
+    # portada
+    slide0 = prs.slides.add_slide(prs.slide_layouts[5])
+    tx = slide0.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(12.3), Inches(1.5))
+    p = tx.text_frame.paragraphs[0]
+    p.text = titulo_portada; p.font.size = Pt(36); p.font.bold = True
+    p.font.color.rgb = RGBColor(0x32,0x8B,0xA1)
+    if incluir_notas:
+        slide0.notes_slide.notes_text_frame.text = f"Periodo: {mes_ini}–{mes_fin}. Filas: {len(df_periodo):,}."
+
+    # slides
+    for (title, figbytes, notes) in figs:
+        add_image_slide(title, figbytes, notes)
+
+    out = io.BytesIO()
+    prs.save(out); out.seek(0)
+    return out
+
+# Ensamblar figuras clave
+figs_export = []
+
+# 1) Comparación mensual y brecha (según métrica foco)
+if metrica_foco == "TPH":
+    f1 = plot_grouped_bars(gm, "rendimiento_real_tph","rendimiento_plan_tph","TPH — Real vs Plan (mensual)")
+    f2 = plot_brecha_mensual(gm, "rendimiento_real_tph","rendimiento_plan_tph","Brecha mensual TPH (Real–Plan)", modo_brecha)
+elif metrica_foco == "Horas":
+    f1 = plot_grouped_bars(gm, "tiempo_operativo_real_h/dia","tiempo_operativo_plan_h/dia","Horas/día — Real vs Plan (mensual)")
+    f2 = plot_brecha_mensual(gm, "tiempo_operativo_real_h/dia","tiempo_operativo_plan_h/dia","Brecha mensual Horas (Real–Plan)", modo_brecha)
+else:
+    f1 = plot_grouped_bars(gm, "produccion_t","produccion_plan_t","Producción (t) — Real vs Plan (mensual)")
+    f2 = plot_brecha_mensual(gm, "produccion_t","produccion_plan_t","Brecha mensual Producción (Real–Plan)", modo_brecha)
+
+figs_export.append(("Comparación mensual vs plan", save_fig_bytes(f1),
+                    "Comparación por mes, medias. Revisar meses con sobre/subcumplimiento para ajustar plan."))
+figs_export.append(("Brecha mensual vs plan", save_fig_bytes(f2),
+                    "Brechas en Δ ó %. Identificar top/bottom 3 meses y causas operativas."))
+
+# 2) ANOVA visual + tablas
+figs_export.append(("ANOVA visual — TPH", save_fig_bytes(fig_tph),
+                    "Medias mensuales TPH con IC95%. Letras Tukey indican grupos no diferentes."))
+figs_export.append(("ANOVA visual — Horas", save_fig_bytes(fig_h),
+                    "Medias mensuales Horas con IC95%. Interpretar meses ‘altos/bajos’."))
+figs_export.append(("ANOVA — tabla TPH", save_fig_bytes(table_fig(anova_tph, "ANOVA — TPH")),
+                    "Si p<α hay efecto mes; considerar replanificación en meses críticos."))
+figs_export.append(("ANOVA — tabla Horas", save_fig_bytes(table_fig(anova_h, "ANOVA — Horas")),
+                    "Tamaño de efecto: usar η² (opcional) para priorizar."))
+
+# 3) Sensibilidad iso-%
+figs_export.append(("Sensibilidad iso-%", save_fig_bytes(fig_iso),
+                    "Mapa con baseline real. Aumentos en TPH/horas deben mostrar Δ producción positivo."))
+
+titulo = f"Chancado — Consolidado ({mes_ini} a {mes_fin})"
+ppt_bytes = build_ppt(dfp, figs_export, None, titulo, incluir_notas=incluir_notas)
+
+st.download_button(
+    "⬇️ Descargar PPTX 16:9",
+    data=ppt_bytes,
+    file_name=f"chancado_fusion_{pd.Timestamp.now():%Y%m%d_%H%M}.pptx",
+    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
 )
-
-# ---------------------------------------------------------
-# Layout principal
-# ---------------------------------------------------------
-st.title("Business Case – Dosificación Inteligente de Ácido en Curado")
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Recuperación final (%)", f"{res['R_final_pct']:.2f}")
-col2.metric("Δ Recup (pts %)", f"{res['dR_total_pts']:.2f}")
-col3.metric("Ácido final (kg/t)", f"{res['A_final_kgpt']:.2f}")
-col4.metric("Ahorro ácido (kg/t)", f"{res['dA_total_kgpt']:.2f}")
-
-col5, col6, col7 = st.columns(3)
-col5.metric("Δ Cu (t/a)", f"{res['dCu_tpy']:,.0f}")
-col6.metric("Ahorro ácido (t/a)", f"{res['acid_saved_tpy']:,.0f}")
-col7.metric("Beneficio anual", fmt_money(res["B_total"]))
-
-st.divider()
-
-# ---------------------------------------------------------
-# Waterfall: Aporte incremental por componente
-# ---------------------------------------------------------
-labels = ["C1 SoftSensor", "C2 UGMs", "C3 Tracker", "C4 Polinomio"]
-benefits = res["B_by"]  # USD/año por componente (marginal)
-fig = waterfall_benefit(benefits, labels, "Waterfall – Aporte incremental por componente (USD/año)", PALETTE)
-st.plotly_chart(fig, use_container_width=True)
-
-# ---------------------------------------------------------
-# Tabla de aportes marginales
-# ---------------------------------------------------------
-st.subheader("Aportes marginales por componente")
-rows = []
-order = ["C1", "C2", "C3", "C4"]
-names = {"C1":"C1 – Soft Sensor P80", "C2":"C2 – Clusterización UGMs", "C3":"C3 – Mineral Tracker", "C4":"C4 – Polinomio + Control"}
-for i, c in enumerate(order):
-    rows.append({
-        "Componente": names[c],
-        "Δ Recuperación (pts %)": round(res["dR_pts_by"][i], 3),
-        "Ahorro ácido (kg/t)": round(res["dA_by"][i], 3),
-        "Beneficio (USD/año)": fmt_money(res["B_by"][i]),
-    })
-st.dataframe(rows, use_container_width=True)
