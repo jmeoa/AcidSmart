@@ -217,7 +217,7 @@ for i, c in enumerate(ORDER):
 # ---------------------------------------------------------
 # UI principal
 # ---------------------------------------------------------
-st.title("SmartAcid Curado – Caso de Negocio (modelo intuitivo sin θ)")
+st.title("SmartAcid – Caso de Negocio")
 
 with st.expander("ℹ️ Cómo funciona este modelo"):
     st.markdown(
