@@ -1,8 +1,9 @@
 import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
+import pandas as pd
 
-st.set_page_config(page_title="SmartAcid Curado – Business Case", layout="wide")
+st.set_page_config(page_title="AcidSmart – Business Case", layout="wide")
 
 # ---------------------------------------------------------
 # Utils
@@ -14,12 +15,16 @@ NAMES = {
     "C3": "C3 – Mineral Tracker",
     "C4": "C4 – Polinomio + Control",
 }
-PALETTE = ["#328BA1", "#DEA942", "#DC5214", "#328BA1"]  # para barras si quieres extender
+PALETTE = ["#328BA1", "#DEA942", "#DC5214", "#5D9B6E"]  # C1:azul, C2:dorado, C3:naranja, C4:verde
+
+COLOR_TOTAL = "#7B5EA7"  # violeta para barra de total
 
 def fmt_money(x):
     return f"${x:,.0f}"
 
-def waterfall_benefit(benefits, labels, title):
+def waterfall_benefit(benefits, labels, colors, title):
+    """Waterfall con colores por componente (PALETTE) y violeta para el total."""
+    bar_colors = list(colors) + [COLOR_TOTAL]
     measure = ["relative"] * len(benefits) + ["total"]
     x = labels + ["Total"]
     y = benefits + [sum(benefits)]
@@ -29,16 +34,18 @@ def waterfall_benefit(benefits, labels, title):
         measure=measure,
         x=x,
         y=y,
-        connector={"line": {"width": 1}},
-        decreasing={"marker": {"color": "#DC5214"}},  # naranja para negativos (no esperamos)
-        increasing={"marker": {"color": "#328BA1"}},  # azul para positivos
-        totals={"marker": {"color": "#DEA942"}}       # dorado para total
+        connector={"line": {"width": 1, "color": "#aaaaaa"}},
+        # decreasing/increasing/totals actúan como fallback cuando marker.color no está definido
+        decreasing={"marker": {"color": "#DC5214"}},
+        increasing={"marker": {"color": "#328BA1"}},
+        totals={"marker": {"color": COLOR_TOTAL}},
+        marker={"color": bar_colors, "opacity": 0.88},
     ))
     fig.update_layout(
         title=title,
         showlegend=False,
         yaxis_title="USD/año",
-        margin=dict(l=10, r=10, t=60, b=10)
+        margin=dict(l=10, r=10, t=60, b=10),
     )
     return fig
 
@@ -89,7 +96,7 @@ def allocate_weighted(deltas, weights, limit_excess):
     return credited
 
 # ---------------------------------------------------------
-# Sidebar: Inputs (todos parten en 0 según tu requerimiento)
+# Sidebar: Inputs
 # ---------------------------------------------------------
 st.sidebar.header("Parámetros de operación")
 T_Mt  = st.sidebar.slider("Toneladas tratadas (Mt/a)", 0.0, 20.0, 10.0, 0.1)
@@ -217,47 +224,83 @@ for i, c in enumerate(ORDER):
 # ---------------------------------------------------------
 # UI principal
 # ---------------------------------------------------------
-st.title("SmartAcid – Caso de Negocio")
+st.title("AcidSmart – Caso de Negocio")
 
 with st.expander("ℹ️ Cómo funciona este modelo"):
     st.markdown(
         """
-**Aportes absolutos por componente**  
-- Ingresas **ΔR** en puntos porcentuales y **ΔA** en kg/t que cada componente podría aportar *si operara solo*.  
-- Los componentes se suman de forma **aditiva**.  
-- Si la suma supera los **límites técnicos** (Rmax o Amin), se aplica un **recorte** según la regla elegida:  
-  - **Secuencial**: se acredita primero C1, luego C2, etc., hasta llenar el límite.  
-  - **Proporcional**: se reduce a todos por igual en proporción a su aporte.  
-  - **Ponderada**: se reduce en proporción a `peso × aporte` (permitiendo priorizar componentes).  
+**Aportes absolutos por componente**
+- Ingresas **ΔR** en puntos porcentuales y **ΔA** en kg/t que cada componente podría aportar *si operara solo*.
+- Los componentes se suman de forma **aditiva**.
+- Si la suma supera los **límites técnicos** (Rmax o Amin), se aplica un **recorte** según la regla elegida:
+  - **Secuencial**: se acredita primero C1, luego C2, etc., hasta llenar el límite.
+  - **Proporcional**: se reduce a todos por igual en proporción a su aporte.
+  - **Ponderada**: se reduce en proporción a `peso × aporte` (permitiendo priorizar componentes).
 - El **Waterfall** muestra el beneficio **acreditado** por cada componente (después de recortes).
         """
     )
 
+# --- Fila 1: KPIs operacionales con deltas ---
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Recuperación final (%)", f"{R_final:.2f}")
-k2.metric("Δ Recup (pts %)", f"{dR_total_pts:.2f}")
-k3.metric("Ácido final (kg/t)", f"{A_final:.2f}")
-k4.metric("Ahorro ácido (kg/t)", f"{dA_total_kgpt:.2f}")
+k1.metric(
+    "Recuperación final (%)",
+    f"{R_final:.2f}",
+    delta=f"{dR_total_pts:+.2f} pts vs R0",
+)
+k2.metric(
+    "Consumo ácido final (kg/t)",
+    f"{A_final:.2f}",
+    delta=f"{-dA_total_kgpt:+.2f} kg/t vs A0",
+    delta_color="inverse",  # bajar ácido es bueno → flecha verde cuando es negativo
+)
+k3.metric("Δ Cu producido (t/a)", f"{dCu_tpy:,.0f}")
+k4.metric("Ácido ahorrado (t/a)", f"{acid_saved_tpy:,.0f}")
 
+# --- Fila 2: Beneficios económicos ---
 k5, k6, k7 = st.columns(3)
-k5.metric("Δ Cu (t/a)", f"{dCu_tpy:,.0f}")
-k6.metric("Ácido ahorrado (t/a)", f"{acid_saved_tpy:,.0f}")
-k7.metric("Beneficio anual", fmt_money(B_total))
+k5.metric("Beneficio Cu (USD/año)", fmt_money(B_Cu))
+k6.metric("Beneficio Ácido (USD/año)", fmt_money(B_Acid))
+k7.metric("Beneficio Total (USD/año)", fmt_money(B_total))
 
 st.divider()
 
+# --- Waterfall con colores por componente ---
 labels = [NAMES[c] for c in ORDER]
-fig = waterfall_benefit(B_by, labels, "Waterfall – Aporte incremental acreditado (USD/año)")
+colors = list(PALETTE)  # un color por componente según su índice
+
+fig = waterfall_benefit(B_by, labels, colors, "Waterfall – Aporte incremental acreditado (USD/año)")
 st.plotly_chart(fig, use_container_width=True)
 
-# Tabla de aportes acreditados
+# --- Tabla de aportes acreditados con estado y total ---
 st.subheader("Aportes acreditados por componente (post-límites)")
+
 rows = []
 for i, c in enumerate(ORDER):
     rows.append({
         "Componente": NAMES[c],
+        "Estado": "✅ Activo" if active_mask[i] else "⏸ Inactivo",
         "Δ Recuperación acreditada (pts %)": round(dR_accredited[i], 3),
         "Ahorro ácido acreditado (kg/t)": round(dA_accredited[i], 3),
         "Beneficio (USD/año)": fmt_money(B_by[i]),
     })
-st.dataframe(rows, use_container_width=True)
+
+# Fila de total
+rows.append({
+    "Componente": "**TOTAL**",
+    "Estado": f"{sum(active_mask)}/{len(ORDER)} activos",
+    "Δ Recuperación acreditada (pts %)": round(sum(dR_accredited), 3),
+    "Ahorro ácido acreditado (kg/t)": round(sum(dA_accredited), 3),
+    "Beneficio (USD/año)": fmt_money(B_total),
+})
+
+df_table = pd.DataFrame(rows)
+st.dataframe(df_table, use_container_width=True, hide_index=True)
+
+# --- Exportar datos ---
+csv = df_table.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="⬇ Descargar tabla (CSV)",
+    data=csv,
+    file_name="acidsmart_resultado.csv",
+    mime="text/csv",
+)
